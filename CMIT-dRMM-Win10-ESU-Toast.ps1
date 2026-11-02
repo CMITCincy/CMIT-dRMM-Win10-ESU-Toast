@@ -1,48 +1,63 @@
 <#
 .SYNOPSIS
-    Windows 10 ESU license check (Year 1 / 2 / 3) with end-user toast notification.
+    Windows 10 ESU / support check with end-user toast notification.
 
 .DESCRIPTION
     Datto RMM component - runs as SYSTEM.
-      1. Exits if the device is not Windows 10 (or is LTSC/LTSB). Bypassed when usrTestDate is set.
-      2. Works out which ESU year is required for today's date (or usrTestDate).
-      3. Checks the local licensing store for that year's ESU add-on, and (by default) every
-         prior year as well. Each must be installed AND activated (LicenseStatus = 1).
-      4. If anything is missing, shows a toast (with optional hero image) to every logged-on
-         user via a short-lived scheduled task (BUILTIN\Users, limited rights).
-      5. Optionally writes a status string to a Datto UDF.
 
-    ESU coverage windows (Patch Tuesday based):
+    Every Windows 10 device is put into one of three groups:
+
+      ELIGIBLE     Windows 10 22H2 (build 19045), Pro / Enterprise / Education / IoT Enterprise (non-LTSC).
+                   Checked for the ESU license(s) required for the date. Each must be installed AND
+                   activated (LicenseStatus = 1). By default all prior years are required too.
+                   Missing license -> "ESU" toast.
+
+      UNSUPPORTED  Windows 10 that cannot use the Windows 10 ESU program and is past its support date:
+                     - Home editions (after the consumer ESU year ended 2026-10-13)
+                     - Builds other than 22H2 (must be upgraded to 22H2 before ESU can apply)
+                     - LTSB/LTSC editions past their own end-of-support date
+                     - Any Windows 10 device once the ESU program ends (after 2028-10-10)
+                   -> "Unsupported" toast.
+
+      SUPPORTED    LTSC editions still inside their own lifecycle. No toast.
+
+    Windows 10 ESU coverage windows (Patch Tuesday based):
       Year 1: 2025-10-15 - 2026-10-13   f520e45e-7413-4a34-a497-d2765967d094
       Year 2: 2026-10-14 - 2027-10-12   1043add5-23b1-4afb-9a0f-64343c8f3f8d
       Year 3: 2027-10-13 - 2028-10-10   83d49986-add3-41d7-ba33-87c7bfb5c0fb
-    After 2028-10-10 the ESU program has ended and every Windows 10 device is flagged.
+
+    LTSB/LTSC end of support:
+      LTSB 2015 (10240)            2025-10-14
+      LTSB 2016 (14393)            2026-10-13   (separate LTSB 2016 ESU program exists - not detected here)
+      LTSC 2019 (17763)            2029-01-09
+      Enterprise LTSC 2021 (19044) 2027-01-12   (separate LTSC 2021 ESU program exists - not detected here)
+      IoT Enterprise LTSC 2021     2032-01-13
+
+    Devices covered by an ESU route this script cannot see (LTSB 2016 / LTSC 2021 ESU, Windows 365,
+    Azure Virtual Desktop, consumer ESU) should be excluded from the job.
 
 .NOTES
     Datto RMM component variables (all optional):
-      usrToastTitle         String   Toast heading
-      usrToastBody          String   Toast message text (overrides the default message)
-      usrSupportContact     String   Name used in the default message       (default: CMIT Solutions)
-      usrAppDisplayName     String   Sender name shown on the toast         (default: IT Support)
+      usrToastTitle         String   ESU toast heading
+      usrToastBody          String   ESU toast message text
+      usrUnsupportedTitle   String   Unsupported toast heading
+      usrUnsupportedBody    String   Unsupported toast message text
+      usrSupportContact     String   Name used in the default messages  (default: CMIT Solutions)
+      usrAppDisplayName     String   Sender name shown on the toast      (default: IT Support)
       usrHeroImgURL         String   https:// URL for the "hero" branding image. PNG @ 364x180.
                                      (default: https://storage.centrastage.net/dattoHero.png)
       usrLearnMoreUrl       String   https:// URL; adds a "Learn more" button when set
-      usrLeadDays           String   Start checking for the NEXT ESU year this many days early (default: 0)
+      usrLeadDays           String   Warn this many days before the next ESU year / an LTSC end date (default: 0)
       usrUDFNumber          String   1-30, writes status to that UDF (blank = disabled)
       usrRequirePriorYears  Boolean  Require all earlier ESU years too (default: true)
       usrDebug              Boolean  Evaluate and print everything, make NO changes, send NO toast
-      usrForceToast         Boolean  Send the toast even when the device is compliant (testing)
+      usrForceToast         Boolean  Send the toast even when the device is compliant/supported (testing)
       usrTestDate           String   yyyy-MM-dd, evaluate as if today were this date (testing).
-                                     Also bypasses the Windows 10 check so the toast can be previewed
-                                     on any Windows machine.
+                                     Also bypasses the Windows 10 check so the toast can be previewed.
+      usrTestUnsupported    Boolean  With usrTestDate on a non-Windows 10 machine, preview the
+                                     Unsupported toast instead of the ESU toast
 
-    Suggested test sequence:
-      1. usrDebug=true                                  -> verify detection and the generated toast XML
-      2. usrDebug=true,  usrTestDate=2027-11-01         -> verify Year 3 logic
-      3. usrDebug=false, usrForceToast=true             -> see the real toast on a test machine
-      4. usrDebug=false, usrForceToast=false            -> production
-
-    Exit codes: 0 = ran successfully (compliant, non-compliant or not applicable), 1 = script error.
+    Exit codes: 0 = ran successfully (any result), 1 = script error.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -63,16 +78,21 @@ function Get-Bool {
 # ---------------------------------------------------------------- variables
 $SupportContact    = Get-Var  'usrSupportContact' 'CMIT Solutions'
 $AppDisplayName    = Get-Var  'usrAppDisplayName' 'IT Support'
-$ToastTitle        = Get-Var  'usrToastTitle'     'Action needed: Windows 10 security updates'
-$ToastBody         = Get-Var  'usrToastBody'      ("This computer runs Windows 10, which needs an Extended Security Update license to keep " +
+$EsuTitle          = Get-Var  'usrToastTitle'     'Action needed: Windows 10 security updates'
+$EsuBody           = Get-Var  'usrToastBody'      ("This computer runs Windows 10, which needs an Extended Security Update license to keep " +
                                                    "receiving security fixes. It does not have one for the current period. " +
                                                    "Please contact $SupportContact to discuss your options.")
+$UnsupTitle        = Get-Var  'usrUnsupportedTitle' 'Action needed: this computer no longer receives security updates'
+$UnsupBody         = Get-Var  'usrUnsupportedBody'  ("This computer's version of Windows 10 no longer receives security fixes from Microsoft, " +
+                                                     "which puts it and your data at greater risk. " +
+                                                     "Please contact $SupportContact to discuss upgrading or replacing it.")
 $HeroImgURL        = Get-Var  'usrHeroImgURL'     'https://storage.centrastage.net/dattoHero.png'
 $LearnMoreUrl      = Get-Var  'usrLearnMoreUrl'
 $UDFNumber         = Get-Var  'usrUDFNumber'
 $RequirePriorYears = Get-Bool 'usrRequirePriorYears' $true
 $DebugMode         = Get-Bool 'usrDebug'
 $ForceToast        = Get-Bool 'usrForceToast'
+$TestUnsupported   = Get-Bool 'usrTestUnsupported'
 $TestDate          = Get-Var  'usrTestDate'
 $LeadDays          = 0
 [void][int]::TryParse((Get-Var 'usrLeadDays' '0'), [ref]$LeadDays)
@@ -82,6 +102,8 @@ $EsuYears = @(
     [pscustomobject]@{ Year = 2; Start = [datetime]'2026-10-14'; End = [datetime]'2027-10-12'; ActivationId = '1043add5-23b1-4afb-9a0f-64343c8f3f8d' }
     [pscustomobject]@{ Year = 3; Start = [datetime]'2027-10-13'; End = [datetime]'2028-10-10'; ActivationId = '83d49986-add3-41d7-ba33-87c7bfb5c0fb' }
 )
+$ConsumerEsuEnd = [datetime]'2026-10-13'
+$HomeSkus       = @(98, 99, 100, 101)   # Core N, Core Country Specific, Core Single Language, Core (Home)
 
 $AppId    = 'CMIT.ITNotifications'
 $WorkDir  = Join-Path $env:ProgramData 'CMIT\ESUToast'
@@ -112,6 +134,20 @@ function Get-EsuState {
     return [pscustomobject]@{ State = 'Licensed'; Detail = "key *****-$($p.PartialProductKey) installed and activated" }
 }
 
+function Get-LtscInfo {
+    param([int]$Build, [bool]$IsIoT)
+    switch ($Build) {
+        10240 { return [pscustomobject]@{ Name = 'LTSB 2015'; End = [datetime]'2025-10-14'; Note = '' } }
+        14393 { return [pscustomobject]@{ Name = 'LTSB 2016'; End = [datetime]'2026-10-13'; Note = 'Separate LTSB 2016 ESU program exists - exclude device if it is enrolled.' } }
+        17763 { return [pscustomobject]@{ Name = 'LTSC 2019'; End = [datetime]'2029-01-09'; Note = '' } }
+        19044 {
+            if ($IsIoT) { return [pscustomobject]@{ Name = 'IoT Enterprise LTSC 2021'; End = [datetime]'2032-01-13'; Note = '' } }
+            return [pscustomobject]@{ Name = 'Enterprise LTSC 2021'; End = [datetime]'2027-01-12'; Note = 'Separate LTSC 2021 ESU program exists - exclude device if it is enrolled.' }
+        }
+    }
+    return $null
+}
+
 function Get-HeroImage {
     param([string]$Url, [string]$OutFile)
     if (-not $Url) { return $false }
@@ -136,8 +172,7 @@ function Get-HeroImage {
 
 try {
     if ($DebugMode) { Write-Host '===== DEBUG MODE: no changes will be made and no toast will be sent =====' }
-    Write-Dbg "Variables: Title='$ToastTitle' | Hero='$HeroImgURL' | LearnMore='$LearnMoreUrl' | LeadDays=$LeadDays | UDF='$UDFNumber' | RequirePriorYears=$RequirePriorYears | ForceToast=$ForceToast | TestDate='$TestDate'"
-    Write-Dbg "Body: $ToastBody"
+    Write-Dbg "Variables: Hero='$HeroImgURL' | LearnMore='$LearnMoreUrl' | LeadDays=$LeadDays | UDF='$UDFNumber' | RequirePriorYears=$RequirePriorYears | ForceToast=$ForceToast | TestDate='$TestDate' | TestUnsupported=$TestUnsupported"
 
     # ------------------------------------------------------------ date
     if ($TestDate) {
@@ -146,70 +181,119 @@ try {
     } else {
         $Today = (Get-Date).Date
     }
+    $stamp = $Today.ToString('yyyy-MM-dd')
 
-    # ------------------------------------------------------------ OS applicability
+    # ------------------------------------------------------------ classify the device
     $os    = Get-CimInstance -ClassName Win32_OperatingSystem
     $build = [int]$os.BuildNumber
-    Write-Host "OS: $($os.Caption) (build $build)"
+    $sku   = [int]$os.OperatingSystemSKU
+    Write-Host "OS: $($os.Caption) (build $build, SKU $sku)"
 
     $isWin10 = ($os.Caption -match 'Windows 10') -and ($build -lt 22000)
     $isLtsc  = $os.Caption -match 'LTSC|LTSB'
-    if (-not $isWin10 -or $isLtsc) {
-        $reason = if (-not $isWin10) { 'Not Windows 10' } else { 'Windows 10 LTSC/LTSB (separate lifecycle)' }
-        if ($TestDate) {
-            Write-Host "TEST DATE: $reason - OS check bypassed so the notification can be previewed."
-        } else {
-            Write-Host "$reason - nothing to do."
+    $isIoT   = $os.Caption -match 'IoT'
+    $isHome  = ($os.Caption -match 'Home') -or ($HomeSkus -contains $sku)
+
+    $category = $null   # Eligible | Unsupported | Supported
+    $reason   = ''
+
+    if (-not $isWin10) {
+        if (-not $TestDate) { Write-Host 'Not Windows 10 - nothing to do.'; exit 0 }
+        if ($TestUnsupported) { $category = 'Unsupported'; $reason = 'TEST preview of Unsupported message' }
+        else                  { $category = 'Eligible' }
+        Write-Host "TEST DATE: not Windows 10 - OS check bypassed, previewing as $category."
+    }
+    elseif ($isLtsc) {
+        $ltsc = Get-LtscInfo -Build $build -IsIoT $isIoT
+        if (-not $ltsc) {
+            Write-Host "Unrecognised LTSB/LTSC build $build - no lifecycle data, skipping."
+            Set-DattoUDF -Number $UDFNumber -Value "Win10 ESU: unknown LTSC build $build ($stamp)"
             exit 0
         }
-    } elseif ($build -ne 19045) {
-        Write-Host "WARNING: build $build is not Windows 10 22H2 (19045). ESU requires 22H2 - device must be upgraded before ESU can apply."
+        Write-Host "Edition: $($ltsc.Name), end of support $($ltsc.End.ToString('yyyy-MM-dd'))"
+        if ($ltsc.Note) { Write-Host "NOTE: $($ltsc.Note)" }
+        if ($Today.AddDays($LeadDays) -le $ltsc.End) {
+            $category = 'Supported'; $reason = "$($ltsc.Name) supported until $($ltsc.End.ToString('yyyy-MM-dd'))"
+        } else {
+            $category = 'Unsupported'
+            $reason = if ($Today -gt $ltsc.End) { "$($ltsc.Name) support ended $($ltsc.End.ToString('yyyy-MM-dd'))" }
+                      else { "$($ltsc.Name) support ends $($ltsc.End.ToString('yyyy-MM-dd')) (within $LeadDays day lead time)" }
+        }
     }
-
-    # ------------------------------------------------------------ which ESU year is required?
-    $required = $EsuYears | Where-Object { $Today -ge $_.Start -and $Today -le $_.End } | Select-Object -First 1
-    $upcoming = $EsuYears | Where-Object { $_.Start -gt $Today -and ($_.Start - $Today).TotalDays -le $LeadDays } | Select-Object -First 1
-    if ($upcoming) {
-        Write-Host "usrLeadDays=$LeadDays : ESU Year $($upcoming.Year) starts $($upcoming.Start.ToString('yyyy-MM-dd')) - checking for it now."
-        $required = $upcoming
+    elseif ($isHome) {
+        if ($Today.AddDays($LeadDays) -le $ConsumerEsuEnd) {
+            Write-Host 'Home edition during the consumer ESU year - enrolment cannot be verified locally, skipping.'
+            Set-DattoUDF -Number $UDFNumber -Value "Win10 ESU: Home edition, consumer ESU unverifiable ($stamp)"
+            exit 0
+        }
+        $category = 'Unsupported'; $reason = 'Home edition - not eligible for Windows 10 ESU beyond the consumer year'
     }
-    $programEnded = $Today -gt $EsuYears[-1].End
-
-    # ------------------------------------------------------------ report all years
-    $states = @{}
-    foreach ($y in $EsuYears) {
-        $states[$y.Year] = Get-EsuState -ActivationId $y.ActivationId
-        Write-Host ("ESU Year {0}: {1}" -f $y.Year, $states[$y.Year].Detail)
-    }
-
-    # ------------------------------------------------------------ evaluate
-    if ($programEnded) {
-        $compliant = $false
-        $summary   = 'ESU program ended ' + $EsuYears[-1].End.ToString('yyyy-MM-dd') + ' - no coverage possible'
-    }
-    elseif (-not $required) {
-        Write-Host "Date is before the ESU Year 1 window ($($EsuYears[0].Start.ToString('yyyy-MM-dd'))). Nothing to check."
-        Set-DattoUDF -Number $UDFNumber -Value "Win10 ESU: not yet required ($($Today.ToString('yyyy-MM-dd')))"
-        exit 0
+    elseif ($build -ne 19045) {
+        $category = 'Unsupported'; $reason = "build $build is not 22H2 (19045) - must be upgraded to 22H2 before ESU can apply"
     }
     else {
-        $toCheck = if ($RequirePriorYears) { $EsuYears | Where-Object { $_.Year -le $required.Year } } else { @($required) }
-        Write-Host ("Required for this date: Year {0}{1}" -f $required.Year, $(if ($RequirePriorYears -and $required.Year -gt 1) { ' (plus all prior years)' } else { '' }))
-        $missing = @($toCheck | Where-Object { $states[$_.Year].State -ne 'Licensed' } |
-                     ForEach-Object { "Y$($_.Year) $(if ($states[$_.Year].State -eq 'NotActivated') {'not activated'} else {'not installed'})" })
-        $compliant = $missing.Count -eq 0
-        $summary   = if ($compliant) { "Year $($required.Year) compliant" } else { "Year $($required.Year) NON-compliant - " + ($missing -join ', ') }
+        $category = 'Eligible'
+    }
+    Write-Host "Category: $category$(if ($reason) { " - $reason" })"
+
+    # ------------------------------------------------------------ evaluate
+    $useUnsupportedMsg = $category -ne 'Eligible'
+
+    if ($category -eq 'Supported') {
+        $compliant = $true
+        $summary   = $reason
+    }
+    elseif ($category -eq 'Unsupported') {
+        $compliant = $false
+        $summary   = "UNSUPPORTED - $reason"
+    }
+    else {
+        # Eligible: report every ESU year, then check what the date requires
+        $states = @{}
+        foreach ($y in $EsuYears) {
+            $states[$y.Year] = Get-EsuState -ActivationId $y.ActivationId
+            Write-Host ("ESU Year {0}: {1}" -f $y.Year, $states[$y.Year].Detail)
+        }
+
+        $required = $EsuYears | Where-Object { $Today -ge $_.Start -and $Today -le $_.End } | Select-Object -First 1
+        $upcoming = $EsuYears | Where-Object { $_.Start -gt $Today -and ($_.Start - $Today).TotalDays -le $LeadDays } | Select-Object -First 1
+        if ($upcoming) {
+            Write-Host "usrLeadDays=$LeadDays : ESU Year $($upcoming.Year) starts $($upcoming.Start.ToString('yyyy-MM-dd')) - checking for it now."
+            $required = $upcoming
+        }
+
+        if ($Today -gt $EsuYears[-1].End) {
+            $compliant = $false
+            $useUnsupportedMsg = $true
+            $summary   = 'UNSUPPORTED - Windows 10 ESU program ended ' + $EsuYears[-1].End.ToString('yyyy-MM-dd')
+        }
+        elseif (-not $required) {
+            Write-Host "Date is before the ESU Year 1 window ($($EsuYears[0].Start.ToString('yyyy-MM-dd'))). Nothing to check."
+            Set-DattoUDF -Number $UDFNumber -Value "Win10 ESU: not yet required ($stamp)"
+            exit 0
+        }
+        else {
+            $toCheck = if ($RequirePriorYears) { $EsuYears | Where-Object { $_.Year -le $required.Year } } else { @($required) }
+            Write-Host ("Required for this date: Year {0}{1}" -f $required.Year, $(if ($RequirePriorYears -and $required.Year -gt 1) { ' (plus all prior years)' } else { '' }))
+            $missing = @($toCheck | Where-Object { $states[$_.Year].State -ne 'Licensed' } |
+                         ForEach-Object { "Y$($_.Year) $(if ($states[$_.Year].State -eq 'NotActivated') {'not activated'} else {'not installed'})" })
+            $compliant = $missing.Count -eq 0
+            $summary   = if ($compliant) { "Year $($required.Year) compliant" } else { "Year $($required.Year) NON-compliant - " + ($missing -join ', ') }
+        }
     }
 
     Write-Host "Result: $summary"
-    Set-DattoUDF -Number $UDFNumber -Value ("Win10 ESU: $summary ($($Today.ToString('yyyy-MM-dd')))")
+    Set-DattoUDF -Number $UDFNumber -Value ("Win10 ESU: $summary ($stamp)")
 
-    $sendToast = (-not $compliant) -or $ForceToast
-    if (-not $sendToast) {
-        Write-Host 'Compliant - no notification needed.'
+    if ($compliant -and -not $ForceToast) {
+        Write-Host 'Compliant / supported - no notification needed.'
         exit 0
     }
     if ($compliant) { Write-Host 'usrForceToast is set - notification will be sent anyway.' }
+
+    if ($useUnsupportedMsg) { $ToastTitle = $UnsupTitle; $ToastBody = $UnsupBody; $msgName = 'Unsupported' }
+    else                    { $ToastTitle = $EsuTitle;   $ToastBody = $EsuBody;   $msgName = 'ESU' }
+    Write-Host "Message: $msgName"
 
     # ------------------------------------------------------------ anyone logged on?
     $explorer = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue)
@@ -312,7 +396,7 @@ try {
     Start-Sleep -Seconds 15
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 
-    Write-Host "Toast sent to $($explorer.Count) interactive session(s)."
+    Write-Host "Toast ($msgName) sent to $($explorer.Count) interactive session(s)."
     exit 0
 }
 catch {
