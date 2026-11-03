@@ -51,10 +51,11 @@
       usrUDFNumber          String   1-30, writes status to that UDF (blank = disabled)
       usrRequirePriorYears  Boolean  Require all earlier ESU years too (default: true)
       usrDebug              Boolean  Evaluate and print everything, make NO changes, send NO toast
-      usrForceToast         Boolean  Send the toast even when the device is compliant/supported (testing)
+      usrForceToast         Boolean  Send the toast even when the device is compliant/supported (testing).
+                                     Also bypasses the Windows 10 check so the toast can be previewed on Windows 11.
       usrTestDate           String   yyyy-MM-dd, evaluate as if today were this date (testing).
                                      Also bypasses the Windows 10 check so the toast can be previewed.
-      usrTestUnsupported    Boolean  With usrTestDate on a non-Windows 10 machine, preview the
+      usrTestUnsupported    Boolean  With usrForceToast or usrTestDate on a non-Windows 10 machine, preview the
                                      Unsupported toast instead of the ESU toast
 
     Exit codes: 0 = ran successfully (any result), 1 = script error.
@@ -172,6 +173,8 @@ function Get-HeroImage {
 
 try {
     if ($DebugMode) { Write-Host '===== DEBUG MODE: no changes will be made and no toast will be sent =====' }
+    Write-Host ("Variables received: usrDebug='{0}' usrForceToast='{1}' usrTestDate='{2}' usrTestUnsupported='{3}'" -f
+                $env:usrDebug, $env:usrForceToast, $env:usrTestDate, $env:usrTestUnsupported)
     Write-Dbg "Variables: Hero='$HeroImgURL' | LearnMore='$LearnMoreUrl' | LeadDays=$LeadDays | UDF='$UDFNumber' | RequirePriorYears=$RequirePriorYears | ForceToast=$ForceToast | TestDate='$TestDate' | TestUnsupported=$TestUnsupported"
 
     # ------------------------------------------------------------ date
@@ -198,10 +201,13 @@ try {
     $reason   = ''
 
     if (-not $isWin10) {
-        if (-not $TestDate) { Write-Host 'Not Windows 10 - nothing to do.'; exit 0 }
-        if ($TestUnsupported) { $category = 'Unsupported'; $reason = 'TEST preview of Unsupported message' }
+        if (-not ($TestDate -or $ForceToast)) {
+            Write-Host 'Not Windows 10 - nothing to do. (Set usrForceToast=true or usrTestDate to preview the toast on this OS.)'
+            exit 0
+        }
+        if ($TestUnsupported) { $category = 'Unsupported'; $reason = 'PREVIEW of Unsupported message' }
         else                  { $category = 'Eligible' }
-        Write-Host "TEST DATE: not Windows 10 - OS check bypassed, previewing as $category."
+        Write-Host "PREVIEW: not Windows 10 - OS check bypassed, previewing the $(if ($TestUnsupported) {'Unsupported'} else {'ESU'}) message."
     }
     elseif ($isLtsc) {
         $ltsc = Get-LtscInfo -Build $build -IsIoT $isIoT
